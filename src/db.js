@@ -77,6 +77,25 @@ CREATE TABLE IF NOT EXISTS draft_refs (
   deleted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_draft_refs_draft ON draft_refs(draft_id);
+
+-- 发布预览凭据：预览成功后落库，确认发布时逐项核对；不产生版本、不关闭草案。
+-- 任一行失效条件（草案被编辑/重命名、其他草案先发布、排程改期/取消、预定时刻已过、
+-- 被更新的预览取代）都能通过表中记录的快照在确认事务内检出。
+CREATE TABLE IF NOT EXISTS preview_tokens (
+  token TEXT PRIMARY KEY,
+  draft_id INTEGER NOT NULL REFERENCES drafts(id),
+  created_at TEXT NOT NULL,
+  latest_version_id INTEGER NOT NULL,          -- 预览时的最新发布版
+  schedule_revision INTEGER NOT NULL,          -- 预览时的排程修订号
+  note TEXT NOT NULL,
+  schedule_status TEXT NOT NULL,               -- immediate | scheduled
+  effective_at TEXT,                           -- scheduled 时的 UTC 时刻；immediate 为 NULL
+  replayed INTEGER NOT NULL DEFAULT 0,
+  draft_content TEXT NOT NULL,                 -- 草案内容（含名称/移动记录）规范化 JSON
+  final_content TEXT NOT NULL,                 -- 将落库的最终版本（条款/顺序/引用/移动记录）规范化 JSON
+  consumed INTEGER NOT NULL DEFAULT 0          -- 确认发布成功后置 1
+);
+CREATE INDEX IF NOT EXISTS idx_preview_draft ON preview_tokens(draft_id);
 `;
 
 function openDb(dbPath) {
@@ -275,6 +294,52 @@ function replaceDraftContent(db, draftId, state) {
   db.prepare('UPDATE drafts SET updated_at = ? WHERE id = ?').run(nowIso(), draftId);
 }
 
+// ---------------------------------------------------------------------------
+// 发布预览凭据（调用方负责事务）
+// ---------------------------------------------------------------------------
+function insertPreviewToken(db, row) {
+  db.prepare(
+    `INSERT INTO preview_tokens
+       (token, draft_id, created_at, latest_version_id, schedule_revision, note,
+        schedule_status, effective_at, replayed, draft_content, final_content, consumed)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,0)`,
+  ).run(
+    row.token,
+    row.draftId,
+    nowIso(),
+    row.latestVersionId,
+    row.scheduleRevision,
+    row.note,
+    row.scheduleStatus,
+    row.effectiveAt ?? null,
+    row.replayed ? 1 : 0,
+    row.draftContent,
+    row.finalContent,
+  );
+}
+
+function getPreviewToken(db, token) {
+  const row = db.prepare('SELECT * FROM preview_tokens WHERE token = ?').get(token);
+  if (!row) return null;
+  row.replayed = !!row.replayed;
+  row.consumed = !!row.consumed;
+  return row;
+}
+
+// 同一草案重新预览：旧凭据作废（确认时返回 PREVIEW_SUPERSEDED）。
+function supersedePreviewTokens(db, draftId) {
+  db.prepare('DELETE FROM preview_tokens WHERE draft_id = ? AND consumed = 0').run(draftId);
+}
+
+function markPreviewConsumed(db, token) {
+  db.prepare('UPDATE preview_tokens SET consumed = 1 WHERE token = ?').run(token);
+}
+
+// 清理陈旧凭据（已消费或早于截止时间），避免无限堆积。
+function prunePreviewTokens(db, createdAtCutoff) {
+  db.prepare('DELETE FROM preview_tokens WHERE consumed = 1 OR created_at < ?').run(createdAtCutoff);
+}
+
 module.exports = {
   openDb,
   nowIso,
@@ -291,4 +356,9 @@ module.exports = {
   saveDraftMoved,
   getScheduleRevision,
   bumpScheduleRevision,
+  insertPreviewToken,
+  getPreviewToken,
+  supersedePreviewTokens,
+  markPreviewConsumed,
+  prunePreviewTokens,
 };

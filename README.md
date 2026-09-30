@@ -5,6 +5,7 @@
 - 录入**首版条款及条款间引用**，原子生成不可变版本；
 - 从任意已发布版本创建**草案**，对带**稳定标识**的条款进行编辑、移动、删除，并登记/删除条款引用；
 - 随时查看草案相对其**基线版本**的结构差异与正文逐字差异；
+- 发布前可先**预览将要落库的最终版本**：沿用同一套三方重放与排程规则，返回相对**最新发布版**的条款正文、顺序、引用差异；预览只发放一枚**确认凭据**，不写版本、不关闭草案；持凭据确认时只能提交与预览**逐字节一致**的内容和生效安排，草案被编辑/重命名、其他草案先发布、排程改期/取消、预定时刻已过都会使凭据失效（附原因、保留草案，重新预览即可）；
 - 并行草案发布时，系统把草案相对基线的改动**重放（replay）**到最新发布版：
   - **不相交**的条款改动自动合并；
   - **同一条款被双方改动**（或一方删除、另一方修改，或双方新增同标识但内容不同）→ **拒绝发布**，逐条说明冲突；
@@ -90,10 +91,12 @@ Docker Compose 额外支持：
    - 移动条款顺序、删除条款；
    - 新增/删除引用，允许引用暂不存在的条款——会被标记为**悬空引用**并阻止发布。
 4. **查看差异**：草案页实时显示相对基线的新增/删除/修改/移动与引用增删，可打开“正文差异”查看逐字增删（`<ins>` / `<del>`）。
-5. **发布**：
-   - 草案存在错误级问题（空正文、悬空引用、标识重复等）时禁止发布；
-   - 若基线不是最新版，发布在 `BEGIN IMMEDIATE` 事务内把改动重放到最新版；不相交改动合并成功则生成新版本；同条款双方改动或重放后悬空则返回冲突说明、回滚事务并保留草案；
-   - 发布时可选择「立即生效」或「定时生效」（UTC 时刻，必须晚于当前）。
+5. **预览（可选）与发布**：
+   - 点「预览将要发布的版本」可先查看将要落库的最终条款全文/顺序/引用（相对最新发布版的增删改、移动与引用差异），以及立即/定时生效安排；预览**不写版本、不关闭草案**；
+   - 草案存在错误级问题（空正文、悬空引用、标识重复等）、重放冲突或排程不满足规则时，预览与发布一样被拒绝并说明原因，且**不发凭据**；
+   - 预览成功后点「按此预览确认发布」即持凭据在同一事务内原子发布与预览完全一致的内容；期间草案被编辑/重命名、其他草案先发布、排程改期/取消、预定时刻已过，页面会提示凭据失效原因，返回重新预览即可；
+   - 原有「直接发布（不预览）」按钮与 `POST /publish` 一步到位方式继续可用；若基线不是最新版，发布在 `BEGIN IMMEDIATE` 事务内把改动重放到最新版；不相交改动合并成功则生成新版本；同条款双方改动或重放后悬空则返回冲突说明、回滚事务并保留草案；
+   - 发布/预览时均可选择「立即生效」或「定时生效」（UTC 时刻，必须晚于当前）。
 6. **发布历史**：在“发布历史”中查看每个不可变版本（顺序/正文/引用完整还原），可下拉选择任意其他版本做两版对比；版本列表标注「即时生效 / 待生效 / 已取消」与生效时刻。
 7. **生效排程**：在“生效排程”页查看当前生效版、待生效队列与排程修订号，对待生效版本改期或取消，并按任意 UTC 时点查询当时生效版本。
 
@@ -145,7 +148,8 @@ Docker Compose 额外支持：
 | `POST` | `/api/drafts/:id/clauses/:key/move` | 移动条款 `{ordinal}` 或 `{after}` |
 | `POST` | `/api/drafts/:id/refs` | 新增引用（允许悬空暂存） |
 | `DELETE` | `/api/drafts/:id/refs/:ordinal` | 删除引用 |
-| `POST` | `/api/drafts/:id/publish` | 原子发布；可选 `effective_at`（未来 UTC 时刻）定时生效 |
+| `POST` | `/api/drafts/:id/preview` | 发布预览（不写版本/不关草案）：跑完整重放与排程校验，成功返回确认凭据与相对最新版的最终条款/顺序/引用差异 |
+| `POST` | `/api/drafts/:id/publish` | 原子发布；可选 `effective_at`（未来 UTC 时刻）定时生效；携带 `preview_token` 时为**凭据确认发布**（内容须与预览完全一致） |
 
 ### 定时生效调用示例（curl）
 
@@ -181,6 +185,69 @@ curl -s 'http://localhost:3000/api/effective'   # 当前生效版
 
 时间参数只接受**带明确时区设计符**的 ISO-8601（`...Z` 或 `...+08:00`），服务端统一转为 UTC 存储与比较；不带时区的“天真”时间串会以 `400 VALIDATION` 拒绝。
 
+### 发布预览与凭据确认（curl）
+
+预览与发布走**完全相同**的校验路径（排程规则 → 草案静态校验 → 三方重放），因此预览能看到的就是确认时将落库的内容：预览成功只生成一枚确认凭据（随机 256-bit，十六进制串），**不写版本、不关闭草案**；确认时服务端在同一个 `BEGIN IMMEDIATE` 事务内重新核对全部前提并重放一遍，只有结果与预览**逐字节一致**才原子发布。
+
+```bash
+# 1) 预览：入参与发布一致（note、可选 effective_at）
+curl -s -X POST http://localhost:3000/api/drafts/1/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"note":"秋季修订","effective_at":"2026-12-01T08:30:00Z"}'
+# 200 ->
+# { "preview": true,
+#   "token": "9f2c…（64 位十六进制确认凭据）",
+#   "draft_id": 1, "note": "秋季修订",
+#   "latest_version_id": 7, "replayed": false,
+#   "schedule_status": "scheduled",
+#   "effective_at": "2026-12-01T08:30:00.000Z",
+#   "schedule_revision": 3, "schedule": {...},
+#   "final": { "order": ["A","B",…],
+#              "clauses": [{ordinal,key,title,body},…],
+#              "refs":    [{ordinal,source,target,label},…] },
+#   "final_moved_keys": ["B"],
+#   "diff": { "added": ["D"], "deleted": [],
+#             "changed": [{key,body,position,edges,…}],
+#             "moved": ["B"],
+#             "refs_added":   [{source,target,label},…],
+#             "refs_removed": [{source,target,label},…] },
+#   "changed_detail": [{ key, titleSegments, bodySegments }] }  # 正文逐字增删（<ins>/<del>）
+# 立即生效预览时 schedule_status="immediate"、effective_at=null。
+# 冲突/悬空/排程问题返回与发布完全相同的 4xx，且响应中没有 token。
+
+# 2) 凭据确认：同一事务内发布与预览完全一致的内容和生效安排
+curl -s -X POST http://localhost:3000/api/drafts/1/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"preview_token":"9f2c…"}'
+# 201 -> 与直接发布相同的响应，另带
+# { "version_id": 8, "replayed": true|false,
+#   "schedule_status": "scheduled", "effective_at": "…",
+#   "confirmed_from_preview": true, "preview_token": "9f2c…",
+#   "schedule": {...} }
+
+# 3) 不带凭据的直接发布继续可用（原有语义不变）
+curl -s -X POST http://localhost:3000/api/drafts/1/publish \
+  -H 'Content-Type: application/json' -d '{"note":"直接发布"}'
+```
+
+凭据失效一律 `409`（凭据不存在/被新预览取代为 `404 PREVIEW_TOKEN_NOT_FOUND`），响应附 `retained: true` 与当前 `schedule`，草案原样保留；重新预览即可获得新凭据：
+
+| 错误码 | 触发原因 |
+| --- | --- |
+| `DRAFT_CHANGED_AFTER_PREVIEW` | 预览后草案的条款/引用被编辑、移动、删除，或草案被重命名 |
+| `LATEST_VERSION_CHANGED` | 预览后有其他草案先发布（最新发布版号变化；重预览将重放到新版） |
+| `SCHEDULE_CHANGED_AFTER_PREVIEW` | 预览后排程发生改期或取消（排程修订号变化） |
+| `EFFECTIVE_TIME_PASSED` | 定时预览预定的 UTC 生效时刻在确认时已过 |
+| `PREVIEW_ALREADY_CONSUMED` | 凭据已成功用于一次确认发布，不可重复使用 |
+| `PREVIEW_TOKEN_NOT_FOUND` | 凭据不存在、不属于该草案，或已被同一草案的新预览取代（`404`） |
+| `PREVIEW_CONTENT_MISMATCH` / `PREVIEW_INVALIDATED` | 兜底：确认事务内重算结果与预览不一致，或发布条件不再满足 |
+
+说明：
+
+- 同一草案重新预览会让旧凭据立即作废；预览凭据不强制过期，已消费/超过 7 天的记录会在下次预览时自动清理。
+- 预览在 `BEGIN IMMEDIATE` 事务内读取最新发布版与排程并与并发发布串行化；但预览本身不持有锁到确认时刻，因此上述前提都在**确认事务内**重新核对，即使期间发生并发发布也不会落库与预览不一致的内容。
+- 预览从不产生版本号：确认成功写入的版本号以确认时刻为准。
+
 ## 目录结构
 
 ```
@@ -190,19 +257,21 @@ curl -s 'http://localhost:3000/api/effective'   # 当前生效版
 ├── package.json
 ├── README.md
 ├── src
-│   ├── server.js      # HTTP 服务、API、原子发布事务、生效排程/改期/取消、时点查询
-│   ├── db.js          # SQLite 连接、建表、版本/草案快照读写、排程修订号
+│   ├── server.js      # HTTP 服务、API、原子发布事务、发布预览/凭据确认、生效排程/改期/取消、时点查询
+│   ├── db.js          # SQLite 连接、建表、版本/草案快照读写、排程修订号、预览凭据存取
 │   └── model.js       # 纯逻辑：差异、移动判定、三方重放、悬空引用校验、生效判定/队列
 ├── public
 │   ├── index.html     # 单页应用入口
 │   ├── styles.css
 │   └── app.js         # 首版录入 / 草案编辑 / 差异 / 发布 / 历史还原 / 生效排程
 └── test
-    ├── model.test.js  # 核心合并逻辑与排程判定单元测试（npm test）
-    └── e2e.js         # 端到端 API 冒烟测试（含定时生效/改期/取消/时点查询）
+    ├── model.test.js    # 核心合并逻辑与排程判定单元测试（npm test）
+    ├── e2e.js           # 端到端 API 冒烟测试（含定时生效/改期/取消/时点查询）
+    └── preview.e2e.js   # 发布预览/凭据确认端到端测试（各类凭据失效场景）
 ```
 
 ## 数据持久化与备份
 
 - 本地运行：数据库即 `DB_PATH` 指向的文件（默认 `./data/charter.db`，WAL 模式另有 `-wal`/`-shm` 伴生文件）。
 - Docker：使用命名卷 `charter-data`，可用 `docker cp` 或直接挂载卷备份；已发布版本的**条款内容快照**只追加、不更新不删除，具备不可变性。排程仅改 `effective_at` 或置 `schedule_status = cancelled`，不触碰条款快照；升级后首次启动会自动为旧库补齐排程列（旧版本按发布时刻即时生效）。
+- 发布预览凭据保存在 `preview_tokens` 表（首次启动自动建表，无需迁移）：仅记录内容快照哈希所需的规范化 JSON 与生效安排，不是版本数据；重新预览会作废旧凭据，确认成功置为已消费，已消费/超 7 天的记录在下次预览时自动清理。删除该表不影响任何已发布版本。

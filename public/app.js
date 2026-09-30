@@ -755,73 +755,264 @@ function openPublish(draftId) {
     effInput.min = localInputValue(new Date(new Date(tail.effective_at).getTime() + 60_000).toISOString());
   }
 
+  // 表单视图（填写说明/生效时刻）与预览视图（查看将要落库的最终版本）互斥切换。
+  const formView = el('div', {});
+  const previewView = el('div', { style: 'display:none' });
+  let previewData = null;
+
+  function collectPayload() {
+    const payload = { note: note.value };
+    if (modeSch.checked) payload.effective_at = localInputToIso(effInput.value);
+    return payload;
+  }
+  function validateForm() {
+    if (modeSch.checked && !effInput.value) {
+      err.innerHTML = '';
+      err.appendChild(renderIssueList([{ message: '请选择未来生效时刻' }]));
+      return false;
+    }
+    return true;
+  }
+
+  function showForm() {
+    previewView.style.display = 'none';
+    formView.style.display = '';
+  }
+  function showPreview(p) {
+    previewData = p;
+    err.innerHTML = '';
+    formView.style.display = 'none';
+    previewView.style.display = '';
+    previewView.innerHTML = '';
+    previewView.appendChild(renderPublishPreview(p));
+  }
+
+  formView.appendChild(el('p', { class: 'muted small' },
+    willReplay
+      ? `基线 v${d.baseline_id} 已落后于最新发布版 v${ov.latest_version_id}：系统将在一个原子事务中，把本草案相对基线的不相交条款改动重放到最新版。若同一条款被双方改动，或重放后产生悬空引用，发布将被拒绝并说明冲突，草案原样保留。`
+      : '将在一个原子事务中生成不可变的新版本；发布后历史可完整还原该版顺序、正文与引用。'));
+  formView.appendChild(el('label', { class: 'fld' }, el('span', {}, '版本说明'), note));
+  formView.appendChild(el('div', { class: 'panel', style: 'margin:6px 0' },
+    el('div', { class: 'panel-bd' },
+      el('div', { style: 'margin-bottom:8px' }, el('strong', {}, '生效时刻')),
+      el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center' },
+        modeImm,
+        el('span', {}, queuePending.length ? '即时生效（队列未清空，不可用）' : '立即生效')),
+      el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px' },
+        modeSch,
+        el('span', {}, '定时生效（UTC，按本地时区输入）'),
+        effInput,
+      ),
+      queuePending.length
+        ? el('div', { class: 'issue warning', style: 'margin-top:8px' },
+            el('span', {}, '⏳'),
+            el('span', {},
+              `已有 ${queuePending.length} 个待生效版本（队列至 v${tail2id(queuePending)}，最后时刻 ${fmtUtc(queuePending[queuePending.length - 1].effective_at)}）：未指定未来时刻的即时发布会被拒绝；定时时刻必须严格晚于队列末尾。`),
+          )
+        : null,
+      effHint,
+    ),
+  ));
+
+  // 底部按钮：直接发布保持原有一步到位方式；预览后可返回修改或凭据确认。
+  const directBtn = el('button', { class: 'btn ghost', onclick: () => doPublish(false) }, '直接发布（不预览）');
+  const previewBtn = el('button', { class: 'btn secondary', onclick: doPreview }, '预览将要发布的版本');
+  const backBtn = el('button', { class: 'btn ghost', style: 'display:none', onclick: () => { previewData = null; showForm(); toggleFooter(); } }, '返回修改');
+  const confirmBtn = el('button', { class: 'btn', style: 'display:none', onclick: () => doPublish(true) }, '按此预览确认发布');
+
+  function toggleFooter() {
+    const showingPreview = previewView.style.display !== 'none';
+    directBtn.style.display = showingPreview ? 'none' : '';
+    previewBtn.style.display = showingPreview ? 'none' : '';
+    backBtn.style.display = showingPreview ? '' : 'none';
+    confirmBtn.style.display = showingPreview ? '' : 'none';
+  }
+
+  async function doPreview() {
+    err.innerHTML = '';
+    if (!validateForm()) return;
+    previewBtn.disabled = true;
+    try {
+      const p = await api('POST', `/api/drafts/${draftId}/preview`, collectPayload());
+      showPreview(p);
+      toggleFooter();
+    } catch (e) {
+      const p = e.payload || {};
+      if (p.error === 'CONFLICT') err.appendChild(renderPublishConflict(p));
+      else if (p.schedule) err.appendChild(renderIssueList([{ message: p.message || e.message }]));
+      else err.appendChild(renderIssueList(p.issues || [{ message: e.message }]));
+    } finally {
+      previewBtn.disabled = false;
+    }
+  }
+
+  async function doPublish(useToken) {
+    err.innerHTML = '';
+    if (!useToken && !validateForm()) return;
+    const payload = useToken ? { preview_token: previewData.token } : collectPayload();
+    confirmBtn.disabled = true;
+    directBtn.disabled = true;
+    try {
+      const r = await api('POST', `/api/drafts/${draftId}/publish`, payload);
+      closeModal();
+      if (r.confirmed_from_preview) {
+        toast(`已按预览原子发布：v${r.version_id}（内容与预览完全一致）`, 'ok');
+      } else if (r.schedule_status === 'scheduled') {
+        toast(`已生成不可变 v${r.version_id}，将于 ${fmtUtc(r.effective_at)} 生效`, 'ok');
+      } else {
+        toast(`已原子发布：v${r.version_id}${r.replayed ? '（已重放到最新版）' : ''}`, 'ok');
+      }
+      state.draftId = null;
+      await refresh();
+    } catch (e) {
+      const p = e.payload || {};
+      const INVALID_CODES = new Set([
+        'DRAFT_CHANGED_AFTER_PREVIEW', 'LATEST_VERSION_CHANGED', 'SCHEDULE_CHANGED_AFTER_PREVIEW',
+        'EFFECTIVE_TIME_PASSED', 'PREVIEW_ALREADY_CONSUMED', 'PREVIEW_TOKEN_NOT_FOUND',
+        'DRAFT_ALREADY_PUBLISHED', 'PREVIEW_CONTENT_MISMATCH', 'PREVIEW_INVALIDATED',
+      ]);
+      // 凭据失效：说明原因、保留草案，可返回修改后重新预览
+      if (INVALID_CODES.has(p.error)) {
+        err.appendChild(renderPreviewInvalid(p));
+        previewData = null;
+        showForm();
+        toggleFooter();
+      } else if (p.error === 'CONFLICT') {
+        err.appendChild(renderPublishConflict(p));
+      } else if (p.schedule) {
+        err.appendChild(renderIssueList([{ message: p.message || e.message }]));
+      } else {
+        err.appendChild(renderIssueList(p.issues || [{ message: e.message }]));
+      }
+    } finally {
+      confirmBtn.disabled = false;
+      directBtn.disabled = false;
+    }
+  }
+
   modal({
     title: '发布草案为新版本',
-    body: el('div', {},
-      el('p', { class: 'muted small' },
-        willReplay
-          ? `基线 v${d.baseline_id} 已落后于最新发布版 v${ov.latest_version_id}：系统将在一个原子事务中，把本草案相对基线的不相交条款改动重放到最新版。若同一条款被双方改动，或重放后产生悬空引用，发布将被拒绝并说明冲突，草案原样保留。`
-          : '将在一个原子事务中生成不可变的新版本；发布后历史可完整还原该版顺序、正文与引用。'),
-      el('label', { class: 'fld' }, el('span', {}, '版本说明'), note),
-      el('div', { class: 'panel', style: 'margin:6px 0' },
-        el('div', { class: 'panel-bd' },
-          el('div', { style: 'margin-bottom:8px' }, el('strong', {}, '生效时刻')),
-          el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center' },
-            modeImm,
-            el('span', {}, queuePending.length ? '即时生效（队列未清空，不可用）' : '立即生效')),
-          el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px' },
-            modeSch,
-            el('span', {}, '定时生效（UTC，按本地时区输入）'),
-            effInput,
-          ),
-          queuePending.length
-            ? el('div', { class: 'issue warning', style: 'margin-top:8px' },
-                el('span', {}, '⏳'),
-                el('span', {},
-                  `已有 ${queuePending.length} 个待生效版本（队列至 v${tail2id(queuePending)}，最后时刻 ${fmtUtc(queuePending[queuePending.length - 1].effective_at)}）：未指定未来时刻的即时发布会被拒绝；定时时刻必须严格晚于队列末尾。`),
-              )
-            : null,
-          effHint,
-        ),
-      ),
-      err,
-    ),
+    body: el('div', {}, formView, previewView, err),
     footer: [
       el('button', { class: 'btn ghost', onclick: closeModal }, '取消'),
-      el('button', {
-        class: 'btn',
-        onclick: async () => {
-          err.innerHTML = '';
-          const payload = { note: note.value };
-          if (modeSch.checked) {
-            if (!effInput.value) { err.appendChild(renderIssueList([{ message: '请选择未来生效时刻' }])); return; }
-            payload.effective_at = localInputToIso(effInput.value);
-          }
-          try {
-            const r = await api('POST', `/api/drafts/${draftId}/publish`, payload);
-            closeModal();
-            if (r.schedule_status === 'scheduled') {
-              toast(`已生成不可变 v${r.version_id}，将于 ${fmtUtc(r.effective_at)} 生效`, 'ok');
-            } else {
-              toast(`已原子发布：v${r.version_id}${r.replayed ? '（已重放到最新版）' : ''}`, 'ok');
-            }
-            state.draftId = null;
-            await refresh();
-          } catch (e) {
-            err.innerHTML = '';
-            const p = e.payload || {};
-            if (p.error === 'CONFLICT') {
-              err.appendChild(renderPublishConflict(p));
-            } else if (p.schedule) {
-              err.appendChild(renderIssueList([{ message: p.message || e.message }]));
-            } else {
-              err.appendChild(renderIssueList(p.issues || [{ message: e.message }]));
-            }
-          }
-        },
-      }, '确认发布'),
+      directBtn,
+      previewBtn,
+      backBtn,
+      confirmBtn,
     ],
   });
+}
+
+// 预览结果面板：将要落库的最终条款全文/顺序/引用 + 相对最新发布版的差异。
+function renderPublishPreview(p) {
+  const box = el('div', {});
+  const latestId = p.latest_version_id;
+  box.appendChild(el('div', { class: 'issue' }, el('span', {}, '🔎'),
+    el('div', {},
+      el('div', {}, el('strong', {}, '以下为将要落库的最终版本（尚未写入，草案未关闭）')),
+      el('div', { class: 'small muted' },
+        `相对当前最新发布版 v${latestId} 的预览结果${p.replayed ? '（已按三方重放合并）' : ''}；确认发布只能提交与此完全一致的内容与生效安排。`),
+    )));
+
+  // 生效安排
+  const schedLine = p.schedule_status === 'scheduled'
+    ? el('div', {}, '⏰ 定时生效：', el('strong', {}, fmtUtc(p.effective_at)), ' / ', fmtLocal(p.effective_at))
+    : el('div', {}, '⚡ ', el('strong', {}, '立即生效'), '（确认提交时即生成并生效）');
+  box.appendChild(el('div', { class: 'panel', style: 'margin:10px 0' },
+    el('div', { class: 'panel-bd' },
+      schedLine,
+      el('div', { class: 'muted small', style: 'margin-top:4px' },
+        `版本说明：${p.note || '（无）'} · 排程修订号 #${p.schedule_revision}`),
+    ),
+  ));
+
+  // 差异概览
+  const diff = p.diff || {};
+  const chips = [];
+  if (diff.added?.length) chips.push(el('span', { class: 'badge ok' }, `新增 ${diff.added.length}：${diff.added.join('、')}`));
+  if (diff.deleted?.length) chips.push(el('span', { class: 'badge err' }, `删除 ${diff.deleted.length}：${diff.deleted.join('、')}`));
+  if (diff.moved?.length) chips.push(el('span', { class: 'badge warn' }, `移动 ${diff.moved.length}：${diff.moved.join('、')}`));
+  const changedKeys = (diff.changed || []).map((c) => c.key);
+  if (changedKeys.length) chips.push(el('span', { class: 'badge warn' }, `修改 ${changedKeys.length}：${changedKeys.join('、')}`));
+  if ((diff.refs_added?.length || 0) + (diff.refs_removed?.length || 0)) {
+    chips.push(el('span', { class: 'badge neutral' }, `引用 +${diff.refs_added.length} / −${diff.refs_removed.length}`));
+  }
+  if (!chips.length) chips.push(el('span', { class: 'muted small' }, '与最新发布版无差异'));
+  box.appendChild(el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px' }, chips));
+
+  // 最终条款（顺序即发布顺序；新增/修改带左边条）
+  const addedSet = new Set(diff.added || []);
+  const changedMap = new Map((p.changed_detail || []).map((c) => [c.key, c]));
+  const movedSet = new Set(diff.moved || []);
+  const deletedSet = new Set(diff.deleted || []);
+
+  if (diff.deleted?.length) {
+    box.appendChild(el('div', { class: 'panel deleted-glow', style: 'margin-bottom:12px' },
+      el('div', { class: 'panel-bd' },
+        el('strong', { style: 'color:var(--red)' }, '本版将删除（相对最新版）：'),
+        el('div', { class: 'small' }, [...deletedSet].join('、')),
+      )));
+  }
+
+  p.final.clauses.forEach((c, i) => {
+    const detail = changedMap.get(c.key);
+    const cls = addedSet.has(c.key) ? 'added-glow' : changedMap.has(c.key) ? 'changed-glow' : '';
+    const node = el('div', { class: `clause ${cls}` });
+    node.appendChild(el('div', { class: 'clause-hd' },
+      el('span', { class: 'ord' }, `#${i + 1}`),
+      el('span', { class: 'key-chip' }, c.key),
+      el('span', { class: 'title' }, c.title),
+      addedSet.has(c.key) ? el('span', { class: 'badge ok' }, '新增') : null,
+      movedSet.has(c.key) ? el('span', { class: 'badge warn' }, '移动') : null,
+      detail ? el('span', { class: 'badge warn' }, '修改') : null,
+    ));
+    const cb = el('div', { class: 'clause-bd' });
+    if (detail?.titleSegments) cb.appendChild(el('div', { style: 'margin-bottom:4px' }, el('span', { html: segmentsHtml(detail.titleSegments) })));
+    cb.appendChild(el('div', { class: 'clause-body', html: detail?.bodySegments ? segmentsHtml(detail.bodySegments) : esc(c.body) }));
+    const outgoing = p.final.refs.filter((r) => r.source === c.key);
+    if (outgoing.length) cb.appendChild(el('div', { class: 'refs-line' }, '引用：',
+      ...outgoing.map((r) => el('span', { class: 'ref-tag' }, '→ ', el('span', { class: 'key-chip' }, r.target), r.label ? `（${r.label}）` : ''))));
+    node.appendChild(cb);
+    box.appendChild(node);
+  });
+
+  // 引用增删
+  if (diff.refs_added?.length || diff.refs_removed?.length) {
+    box.appendChild(el('h4', {}, '引用差异'));
+    for (const r of diff.refs_removed || []) {
+      box.appendChild(el('div', {}, el('del', {}, `${r.source} → ${r.target}${r.label ? '（' + r.label + '）' : ''}`)));
+    }
+    for (const r of diff.refs_added || []) {
+      box.appendChild(el('div', {}, el('ins', {}, `${r.source} → ${r.target}${r.label ? '（' + r.label + '）' : ''}`)));
+    }
+  }
+
+  box.appendChild(el('div', { class: 'muted small', style: 'margin-top:10px;word-break:break-all' },
+    '确认凭据（已由系统在下方确认按钮中携带，无需复制）：', el('br'), el('span', { class: 'key-chip' }, p.token)));
+  return box;
+}
+
+function renderPreviewInvalid(p) {
+  const box = el('div', {});
+  const reasonMap = {
+    DRAFT_CHANGED_AFTER_PREVIEW: '草案在预览后被编辑或重命名',
+    LATEST_VERSION_CHANGED: '预览后有其他草案先发布，最新发布版已变化',
+    SCHEDULE_CHANGED_AFTER_PREVIEW: '预览后生效排程被改期或取消',
+    EFFECTIVE_TIME_PASSED: '预览预定的生效时刻已过',
+    PREVIEW_ALREADY_CONSUMED: '该预览凭据已被使用',
+    PREVIEW_TOKEN_NOT_FOUND: '预览凭据不存在或已被新预览取代',
+    DRAFT_ALREADY_PUBLISHED: '草案已被发布关闭',
+    PREVIEW_CONTENT_MISMATCH: '当前将发布的内容与预览结果不一致',
+    PREVIEW_INVALIDATED: '预览时的发布条件已不再满足',
+  };
+  box.appendChild(el('div', { class: 'issue error' }, el('span', {}, '⚠️'),
+    el('div', {},
+      el('div', {}, el('strong', {}, `预览凭据已失效（${p.error}）：${reasonMap[p.error] || '请重新预览'}`)),
+      el('div', { class: 'small muted' }, p.message || '草案已原样保留，可返回修改后重新预览再确认。'),
+    )));
+  if (p.conflicts?.length || p.dangling?.length) box.appendChild(renderPublishConflict(p));
+  if (p.issues?.length) box.appendChild(renderIssueList(p.issues));
+  return box;
 }
 
 function tail2id(pending) {
