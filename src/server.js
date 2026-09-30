@@ -2,6 +2,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const {
   openDb,
   loadVersionState,
@@ -17,6 +18,9 @@ const {
   saveDraftMoved,
   getScheduleRevision,
   bumpScheduleRevision,
+  insertPublishPreview,
+  getPublishPreviewByToken,
+  markPublishPreviewConsumed,
   nowIso,
 } = require('./db');
 const {
@@ -359,6 +363,10 @@ function draftRoutes(method, url, body, query) {
   }
 
   if (method === 'POST' && sub === '/publish') return handlePublish(draftId, body);
+  if (method === 'POST' && sub === '/preview') return handlePreviewPublish(draftId, body);
+
+  const previewGet = sub.match(/^\/previews\/([A-Za-z0-9_-]+)$/);
+  if (method === 'GET' && previewGet) return handlePreviewGet(draftId, previewGet[1]);
 
   if (sub === '/clauses' || sub.startsWith('/clauses/')) {
     return clauseRoutes(method, sub, body, draftId);
@@ -467,13 +475,207 @@ function refRoutes(method, sub, body, draftId) {
 }
 
 // ---------------------------------------------------------------------------
-// 发布：重放 / 冲突拒绝 / 原子快照
+// 发布：预览凭据 / 重放 / 冲突拒绝 / 原子快照
 // ---------------------------------------------------------------------------
+// 状态指纹：用于凭据失效判定（草案被编辑 / 最终落库内容变化）
+function canonicalState(state) {
+  return JSON.stringify({
+    o: state.order,
+    c: state.order.map((k) => {
+      const c = state.clauses.get(k);
+      return [c.title, c.body];
+    }),
+    e: state.edges.map((e) => [e.source, e.target, e.label || '']),
+  });
+}
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+// 在已开启的写事务（BEGIN IMMEDIATE）内评估一次发布请求。
+// 沿用既有全部三方重放与排程规则；成功返回 { plan }，
+// 失败返回 { status, payload }（与原直接发布的错误语义完全一致，调用方据此回滚）。
+function evaluatePublishPlan({ draftId, meta, note, requestedAt }) {
+  const nowMs = Date.now();
+  const versions = listVersions(db);
+  const latestId = versions[versions.length - 1].id;
+  const latestMeta = getVersionMeta(db, latestId);
+  const pending = pendingVersions(versions, nowMs);
+
+  // 0) 排程规则
+  if (requestedAt) {
+    if (requestedAt.ms <= nowMs) {
+      return {
+        status: 400,
+        payload: {
+          error: 'PAST_EFFECTIVE_AT',
+          message: '未来生效时刻必须严格晚于当前 UTC 时间',
+          schedule: buildSchedule({ nowMs, versions }),
+        },
+      };
+    }
+    // 未来生效时刻须按发布版顺序严格递增：仅需晚于队列末尾（最大 id 的待生效版本）
+    const tail = pending.length ? pending[pending.length - 1] : null;
+    if (tail && Date.parse(tail.effective_at) >= requestedAt.ms) {
+      return {
+        status: 409,
+        payload: {
+          error: 'SCHEDULE_ORDER_VIOLATION',
+          message: `未来生效时刻必须严格晚于已排程的最后一个版本 v${tail.id}（${tail.effective_at}）`,
+          schedule: buildSchedule({ nowMs, versions }),
+        },
+      };
+    }
+  } else if (pending.length) {
+    // 队列未清空时，未指定时刻的发布（即时生效）拒绝
+    const tail = pending[pending.length - 1];
+    return {
+      status: 409,
+      payload: {
+        error: 'QUEUE_NOT_EMPTY',
+        message: `已有 ${pending.length} 个待生效版本（下一个 v${pending[0].id} 于 ${pending[0].effective_at} 生效，队列至 v${tail.id}）。队列未清空时不能即时发布；如需继续，请指定严格晚于 v${tail.id}（${tail.effective_at}）的未来生效时刻，或先取消/改期清空队列。`,
+        schedule: buildSchedule({ nowMs, versions }),
+      },
+    };
+  }
+
+  const draftState = loadDraftState(db, draftId);
+  const draftMoved = new Set(loadDraftMoved(db, draftId));
+  const baselineState = loadVersionState(db, meta.baseline_id);
+  const latestState = loadVersionState(db, latestId);
+
+  // 1) 草案自身的结构问题（悬空引用等）：拒绝发布，草案原样保留
+  const issues = validateState(draftState).filter((i) => i.level === 'error');
+  if (issues.length) {
+    return { status: 409, payload: { error: 'DRAFT_INVALID', message: '草案存在必须修复的问题，已保留草案', issues } };
+  }
+
+  const effectiveAt = requestedAt ? requestedAt.iso : new Date(nowMs).toISOString();
+  const scheduleStatus = requestedAt ? 'scheduled' : 'immediate';
+
+  // 2) 基线即最新版：直接采用草案内容
+  if (meta.baseline_id === latestId) {
+    if (stateEqual(draftState, latestState) && draftMoved.size === 0) {
+      return { status: 400, payload: { error: 'NO_CHANGES', message: '草案与最新版完全一致，无需发布' } };
+    }
+    const newMoved = new Set(latestMeta.moved_keys);
+    for (const k of draftMoved) if (draftState.clauses.has(k)) newMoved.add(k);
+    return {
+      plan: {
+        draftId,
+        note,
+        replayed: false,
+        latestId,
+        finalState: draftState,
+        finalMoved: newMoved,
+        effectiveAt,
+        scheduleStatus,
+        scheduled: !!requestedAt,
+      },
+    };
+  }
+
+  // 3) 基线落后：把草案改动重放到最新发布版
+  // 最新版相对本草案基线累积移动过的条款（基线之后各版移动记录的并集）
+  const latestMovedKeys = new Set();
+  for (const v of versions) {
+    if (v.id > meta.baseline_id && v.id <= latestId) {
+      for (const k of v.moved_keys) latestMovedKeys.add(k);
+    }
+  }
+
+  const result = replayDraft({
+    baseline: baselineState,
+    latest: latestState,
+    draft: draftState,
+    draftMoved,
+    latestMovedKeys,
+  });
+  if (!result.ok) {
+    return {
+      status: 409,
+      payload: {
+        error: 'CONFLICT',
+        message: '发布被拒绝：与最新发布版存在冲突，草案已保留',
+        conflicts: result.conflicts,
+        dangling: result.dangling,
+      },
+    };
+  }
+  if (stateEqual(result.merged, latestState)) {
+    return { status: 400, payload: { error: 'NO_CHANGES', message: '改动已全部包含在最新版中，无需发布' } };
+  }
+  return {
+    plan: {
+      draftId,
+      note,
+      replayed: true,
+      latestId,
+      finalState: result.merged,
+      finalMoved: result.mergedMoved,
+      effectiveAt,
+      scheduleStatus,
+      scheduled: !!requestedAt,
+    },
+  };
+}
+
+// 在同一写事务内把已评估的计划落库：不可变版本快照 + 草案关闭 + （定时）排程入队。
+function commitPublishPlan(plan) {
+  const newId = insertVersion(db, {
+    note: plan.note,
+    baselineId: plan.latestId,
+    draftId: plan.draftId,
+    state: plan.finalState,
+    movedKeys: plan.finalMoved,
+    effectiveAt: plan.effectiveAt,
+    scheduleStatus: plan.scheduleStatus,
+  });
+  db.prepare('UPDATE drafts SET status = ? WHERE id = ?').run('published', plan.draftId);
+  if (plan.scheduled) bumpScheduleRevision(db);
+  return {
+    status: 201,
+    payload: {
+      version_id: newId,
+      replayed: plan.replayed,
+      ...(plan.replayed ? { baseline_latest_id: plan.latestId } : {}),
+      schedule_status: plan.scheduleStatus,
+      effective_at: plan.effectiveAt,
+      ...(plan.scheduled ? { schedule: buildSchedule() } : {}),
+    },
+  };
+}
+
+// BEGIN IMMEDIATE 事务包装：与并发发布串行化，保证原子且可重复读。
+function runInImmediateTx(fn) {
+  db.pragma('foreign_keys = ON');
+  db.prepare('BEGIN IMMEDIATE').run();
+  try {
+    const out = fn();
+    if (out.status === 200 || out.status === 201) db.prepare('COMMIT').run();
+    else db.prepare('ROLLBACK').run();
+    return out;
+  } catch (err) {
+    try {
+      db.prepare('ROLLBACK').run();
+    } catch {}
+    throw err;
+  }
+}
+
+// POST /api/drafts/:id/publish
+// - 携带 preview_token：凭据确认，只能在同一事务内发布与预览完全一致的内容及生效安排；
+// - 不携带：原有直接发布，错误语义保持不变。
 function handlePublish(draftId, body) {
   const meta = getDraftMeta(db, draftId);
   if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
   if (meta.status !== 'open') {
     return { status: 409, payload: { error: 'CLOSED', message: '草案已发布' } };
+  }
+
+  if (body.preview_token != null && String(body.preview_token).trim() !== '') {
+    return handleConfirmPublish(draftId, body, meta);
   }
 
   const note = String(body.note || '').trim() || `发布草案：${meta.name}`;
@@ -486,161 +688,236 @@ function handlePublish(draftId, body) {
     requestedAt = parsed;
   }
 
-  const publish = db.transaction(() => {
-    const nowMs = Date.now();
-    const versions = listVersions(db);
-    const latestId = versions[versions.length - 1].id;
-    const latestMeta = getVersionMeta(db, latestId);
-    const pending = pendingVersions(versions, nowMs);
+  return runInImmediateTx(() => {
+    const evaluated = evaluatePublishPlan({ draftId, meta, note, requestedAt });
+    if (!evaluated.plan) return evaluated;
+    return commitPublishPlan(evaluated.plan);
+  });
+}
 
-    // 0) 排程规则
-    if (requestedAt) {
-      if (requestedAt.ms <= nowMs) {
+// 构造预览响应：将落库的最终版本（条款正文/顺序/引用）及其相对最新发布版的差异、生效安排。
+function buildPreviewPayload({ draftId, meta, plan }) {
+  const latestState = loadVersionState(db, plan.latestId);
+  const diff = diffStates(latestState, plan.finalState, new Set(plan.finalMoved));
+  const payload = {
+    draft_id: draftId,
+    draft_status: 'open',
+    note: plan.note,
+    latest_version_id: plan.latestId,
+    replayed: plan.replayed,
+    ...(plan.replayed ? { baseline_id: meta.baseline_id } : {}),
+    schedule_status: plan.scheduleStatus,
+    effective_at: plan.scheduled ? plan.effectiveAt : null,
+    version: {
+      note: plan.note,
+      order: plan.finalState.order,
+      clauses: plan.finalState.order.map((k, i) => ({ ordinal: i, ...plan.finalState.clauses.get(k) })),
+      refs: plan.finalState.edges.map((e, i) => ({ ordinal: i, ...e })),
+    },
+    diff: {
+      added: diff.added,
+      deleted: diff.deleted,
+      changed: diff.changed,
+      moved: diff.moved,
+      refs_added: diff.refsAdded,
+      refs_removed: diff.refsRemoved,
+      changed_detail: diff.changed.map((c) => {
+        const b = latestState.clauses.get(c.key);
+        const d = plan.finalState.clauses.get(c.key);
+        return {
+          ...c,
+          titleSegments: textDiff(b.title, d.title),
+          bodySegments: c.body ? textDiff(b.body, d.body) : null,
+        };
+      }),
+    },
+    previewed_at: nowIso(),
+  };
+  if (plan.scheduled) {
+    // 预览不入队；给出“入队后”的排程视图与队列位置
+    const schedule = buildSchedule();
+    const tail = schedule.pending.length ? schedule.pending[schedule.pending.length - 1] : null;
+    payload.schedule = schedule;
+    payload.would_enqueue = {
+      effective_at: plan.effectiveAt,
+      position_after: schedule.pending.length,
+      tail_version_id: tail ? tail.id : null,
+    };
+  }
+  return payload;
+}
+
+// POST /api/drafts/:id/preview
+// 预览将要落库的最终版本：不写版本、不关闭草案；仅预览成功时返回确认凭据。
+function handlePreviewPublish(draftId, body) {
+  const meta = getDraftMeta(db, draftId);
+  if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
+  if (meta.status !== 'open') {
+    return { status: 409, payload: { error: 'CLOSED', message: '草案已发布' } };
+  }
+
+  const note = String(body.note || '').trim() || `发布草案：${meta.name}`;
+  let requestedAt = null;
+  if (body.effective_at != null && String(body.effective_at).trim() !== '') {
+    const parsed = parseEffectiveAt(body.effective_at);
+    if (!parsed.ok) return { status: 400, payload: { error: 'VALIDATION', message: parsed.message } };
+    requestedAt = parsed;
+  }
+
+  return runInImmediateTx(() => {
+    const evaluated = evaluatePublishPlan({ draftId, meta, note, requestedAt });
+    if (!evaluated.plan) return evaluated;
+    const plan = evaluated.plan;
+
+    const token = crypto.randomBytes(32).toString('base64url');
+    const payload = buildPreviewPayload({ draftId, meta, plan });
+    insertPublishPreview(db, {
+      draftId,
+      token,
+      note,
+      scheduleStatus: plan.scheduleStatus,
+      effectiveAt: plan.scheduled ? plan.effectiveAt : null,
+      latestVersionId: plan.latestId,
+      scheduleRevision: getScheduleRevision(db),
+      draftFingerprint: sha256(canonicalState(loadDraftState(db, draftId))),
+      finalFingerprint: sha256(canonicalState(plan.finalState)),
+      finalMoved: plan.finalMoved,
+      payload,
+    });
+    return { status: 200, payload: { token, ...payload } };
+  });
+}
+
+// 凭据失效原因（只读复核，不消费凭据）；返回 null 表示凭据当前仍可确认。
+function previewStaleReason(preview) {
+  if (preview.status === 'consumed') {
+    return { reason: 'preview-consumed', message: '该预览凭据已用于发布，不能重复使用；如需再次发布请重新预览' };
+  }
+  const meta = getDraftMeta(db, preview.draft_id);
+  if (!meta || meta.status !== 'open') {
+    return { reason: 'draft-closed', message: '草案已被发布或关闭，凭据失效；请重新预览' };
+  }
+  if (sha256(canonicalState(loadDraftState(db, preview.draft_id))) !== preview.draft_fingerprint) {
+    return { reason: 'draft-edited', message: '预览后草案已被编辑，凭据失效；请重新预览' };
+  }
+  const versions = listVersions(db);
+  if (versions[versions.length - 1].id !== preview.latest_version_id) {
+    return { reason: 'newer-version-published', message: '预览后已有其他草案先发布（最新发布版已变化），凭据失效；请重新预览' };
+  }
+  if (getScheduleRevision(db) !== preview.schedule_revision) {
+    return { reason: 'schedule-changed', message: '预览后排程发生改期或取消，凭据失效；请重新预览' };
+  }
+  if (preview.schedule_status === 'scheduled' && Date.parse(preview.effective_at) <= Date.now()) {
+    return { reason: 'effective-time-passed', message: '预览锁定的预定生效时刻已过，凭据失效；请重新预览' };
+  }
+  return null;
+}
+
+function stalePayload(preview, stale, extra = {}) {
+  const payload = {
+    error: 'PREVIEW_STALE',
+    message: stale.message,
+    reason: stale.reason,
+    repreview: true,
+    draft_id: preview.draft_id,
+    ...extra,
+  };
+  if (['schedule-changed', 'effective-time-passed'].includes(stale.reason)) {
+    payload.schedule = buildSchedule();
+  }
+  return payload;
+}
+
+// GET /api/drafts/:id/previews/:token —— 查看预览及其凭据当前是否仍可确认
+function handlePreviewGet(draftId, token) {
+  const preview = getPublishPreviewByToken(db, token);
+  if (!preview || preview.draft_id !== draftId) {
+    return { status: 404, payload: { error: 'NOT_FOUND', message: '预览凭据不存在或不属于该草案' } };
+  }
+  const stale = previewStaleReason(preview);
+  return {
+    status: 200,
+    payload: {
+      preview_id: preview.id,
+      token: preview.token,
+      status: preview.status,
+      usable: preview.status === 'open' && !stale,
+      ...(stale ? { stale_reason: stale.reason, stale_message: stale.message, repreview: true } : {}),
+      ...preview.payload,
+    },
+  };
+}
+
+// 凭据确认：只能在同一事务内发布与预览完全一致的内容及生效安排。
+function handleConfirmPublish(draftId, body, meta) {
+  const token = String(body.preview_token || '').trim();
+  return runInImmediateTx(() => {
+    const preview = getPublishPreviewByToken(db, token);
+    if (!preview || preview.draft_id !== draftId) {
+      return {
+        status: 404,
+        payload: { error: 'PREVIEW_NOT_FOUND', message: '预览凭据不存在或不属于该草案，请重新预览', repreview: true, draft_id: draftId },
+      };
+    }
+
+    // 凭据已消费 / 草案已关闭
+    if (preview.status === 'consumed') {
+      return { status: 409, payload: stalePayload(preview, previewStaleReason(preview) || {
+        reason: 'preview-consumed', message: '该预览凭据已用于发布，不能重复使用；如需再次发布请重新预览',
+      }) };
+    }
+    if (meta.status !== 'open') {
+      return { status: 409, payload: stalePayload(preview, { reason: 'draft-closed', message: '草案已被发布或关闭，凭据失效；请重新预览' }) };
+    }
+
+    // 回显校验：确认请求可省略说明/时刻（省略即采用预览锁定值）；
+    // 一旦显式携带，就必须与预览完全一致。
+    if (body.note !== undefined && String(body.note).trim() !== '' && String(body.note).trim() !== preview.note) {
+      return {
+        status: 400,
+        payload: { error: 'CONFIRM_MISMATCH', message: '发布说明与预览时不一致：只能发布与预览完全相同的内容及生效安排，请重新预览', repreview: true },
+      };
+    }
+    const hasEff = body.effective_at != null && String(body.effective_at).trim() !== '';
+    if (hasEff) {
+      const parsed = parseEffectiveAt(body.effective_at);
+      if (!parsed.ok) return { status: 400, payload: { error: 'VALIDATION', message: parsed.message } };
+      if (preview.schedule_status !== 'scheduled' || parsed.iso !== preview.effective_at) {
         return {
           status: 400,
-          payload: {
-            error: 'PAST_EFFECTIVE_AT',
-            message: '未来生效时刻必须严格晚于当前 UTC 时间',
-            schedule: buildSchedule({ nowMs, versions }),
-          },
+          payload: { error: 'CONFIRM_MISMATCH', message: '生效安排与预览时不一致：只能确认与预览完全相同的内容及生效安排，请重新预览', repreview: true },
         };
       }
-      // 未来生效时刻须按发布版顺序严格递增：仅需晚于队列末尾（最大 id 的待生效版本）
-      const tail = pending.length ? pending[pending.length - 1] : null;
-      if (tail && Date.parse(tail.effective_at) >= requestedAt.ms) {
-        return {
-          status: 409,
-          payload: {
-            error: 'SCHEDULE_ORDER_VIOLATION',
-            message: `未来生效时刻必须严格晚于已排程的最后一个版本 v${tail.id}（${tail.effective_at}）`,
-            schedule: buildSchedule({ nowMs, versions }),
-          },
-        };
-      }
-    } else if (pending.length) {
-      // 队列未清空时，未指定时刻的发布（即时生效）拒绝
-      const tail = pending[pending.length - 1];
+    }
+
+    // 失效条件：草案被编辑 / 其他草案先发布 / 排程改期或取消 / 预定时刻已过
+    const stale = previewStaleReason(preview);
+    if (stale) return { status: 409, payload: stalePayload(preview, stale) };
+
+    // 同一事务内按预览锁定的安排重新评估，确保真正落库内容与预览逐字节一致
+    const requestedAt = preview.schedule_status === 'scheduled'
+      ? { iso: preview.effective_at, ms: Date.parse(preview.effective_at) }
+      : null;
+    const evaluated = evaluatePublishPlan({ draftId, meta, note: preview.note, requestedAt });
+    if (!evaluated.plan) {
       return {
         status: 409,
-        payload: {
-          error: 'QUEUE_NOT_EMPTY',
-          message: `已有 ${pending.length} 个待生效版本（下一个 v${pending[0].id} 于 ${pending[0].effective_at} 生效，队列至 v${tail.id}）。队列未清空时不能即时发布；如需继续，请指定严格晚于 v${tail.id}（${tail.effective_at}）的未来生效时刻，或先取消/改期清空队列。`,
-          schedule: buildSchedule({ nowMs, versions }),
-        },
+        payload: stalePayload(preview, { reason: 'plan-changed', message: '当前状态已无法得到与预览一致的发布结果，凭据失效；请重新预览' }, { detail: evaluated.payload }),
       };
     }
-
-    const draftState = loadDraftState(db, draftId);
-    const draftMoved = new Set(loadDraftMoved(db, draftId));
-    const baselineState = loadVersionState(db, meta.baseline_id);
-    const latestState = loadVersionState(db, latestId);
-
-    // 1) 草案自身的结构问题（悬空引用等）：拒绝发布，草案原样保留
-    const issues = validateState(draftState).filter((i) => i.level === 'error');
-    if (issues.length) {
-      return { status: 409, payload: { error: 'DRAFT_INVALID', message: '草案存在必须修复的问题，已保留草案', issues } };
-    }
-
-    const effectiveAt = requestedAt ? requestedAt.iso : new Date(nowMs).toISOString();
-    const scheduleStatus = requestedAt ? 'scheduled' : 'immediate';
-
-    // 2) 重放到最新版
-    if (meta.baseline_id === latestId) {
-      if (stateEqual(draftState, latestState) && draftMoved.size === 0) {
-        return { status: 400, payload: { error: 'NO_CHANGES', message: '草案与最新版完全一致，无需发布' } };
-      }
-      const newMoved = new Set(latestMeta.moved_keys);
-      for (const k of draftMoved) if (draftState.clauses.has(k)) newMoved.add(k);
-      const newId = insertVersion(db, {
-        note,
-        baselineId: latestId,
-        draftId,
-        state: draftState,
-        movedKeys: newMoved,
-        effectiveAt,
-        scheduleStatus,
-      });
-      db.prepare('UPDATE drafts SET status = ? WHERE id = ?').run('published', draftId);
-      if (requestedAt) bumpScheduleRevision(db);
-      return {
-        status: 201,
-        payload: {
-          version_id: newId,
-          replayed: false,
-          schedule_status: scheduleStatus,
-          effective_at: effectiveAt,
-          ...(requestedAt ? { schedule: buildSchedule() } : {}),
-        },
-      };
-    }
-
-    // 最新版相对本草案基线累积移动过的条款（基线之后各版移动记录的并集）
-    const latestMovedKeys = new Set();
-    for (const v of versions) {
-      if (v.id > meta.baseline_id && v.id <= latestId) {
-        for (const k of v.moved_keys) latestMovedKeys.add(k);
-      }
-    }
-
-    const result = replayDraft({
-      baseline: baselineState,
-      latest: latestState,
-      draft: draftState,
-      draftMoved,
-      latestMovedKeys,
-    });
-    if (!result.ok) {
+    if (sha256(canonicalState(evaluated.plan.finalState)) !== preview.final_fingerprint) {
       return {
         status: 409,
-        payload: {
-          error: 'CONFLICT',
-          message: '发布被拒绝：与最新发布版存在冲突，草案已保留',
-          conflicts: result.conflicts,
-          dangling: result.dangling,
-        },
+        payload: stalePayload(preview, { reason: 'content-changed', message: '最终落库内容与预览不一致，凭据失效；请重新预览' }),
       };
     }
-    if (stateEqual(result.merged, latestState)) {
-      return { status: 400, payload: { error: 'NO_CHANGES', message: '改动已全部包含在最新版中，无需发布' } };
-    }
-    const newId = insertVersion(db, {
-      note,
-      baselineId: latestId,
-      draftId,
-      state: result.merged,
-      movedKeys: result.mergedMoved,
-      effectiveAt,
-      scheduleStatus,
-    });
-    db.prepare('UPDATE drafts SET status = ? WHERE id = ?').run('published', draftId);
-    if (requestedAt) bumpScheduleRevision(db);
-    return {
-      status: 201,
-      payload: {
-        version_id: newId,
-        replayed: true,
-        baseline_latest_id: latestId,
-        schedule_status: scheduleStatus,
-        effective_at: effectiveAt,
-        ...(requestedAt ? { schedule: buildSchedule() } : {}),
-      },
-    };
-  });
 
-  db.pragma('foreign_keys = ON');
-  // BEGIN IMMEDIATE：与并发发布串行化，保证原子且可重复读
-  db.prepare('BEGIN IMMEDIATE').run();
-  try {
-    const out = publish();
-    if (out.status === 201) db.prepare('COMMIT').run();
-    else db.prepare('ROLLBACK').run();
+    markPublishPreviewConsumed(db, preview.id);
+    const out = commitPublishPlan(evaluated.plan);
+    out.payload.confirmed_preview = true;
+    out.payload.preview_id = preview.id;
     return out;
-  } catch (err) {
-    try {
-      db.prepare('ROLLBACK').run();
-    } catch {}
-    throw err;
-  }
+  });
 }
 
 // ---------------------------------------------------------------------------

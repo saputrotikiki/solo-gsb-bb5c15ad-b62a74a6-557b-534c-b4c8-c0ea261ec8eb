@@ -265,6 +265,137 @@ async function main() {
   const v6snap = await call('GET', '/api/versions/6');
   ok(v6snap.schedule_status === 'cancelled' && v6snap.clauses.some((c) => c.key === 'Y'), '已取消版本快照仍可完整还原');
 
+  // ===========================================================================
+  // 发布预览 + 凭据确认（本轮新增）
+  // 当前：v7 即时生效、队列为空
+  // ===========================================================================
+  // 1) 预览成功：返回凭据、差异与最终内容；不写版本、草案保持 open
+  const dp1 = await call('POST', '/api/drafts', { name: '预览dp1' }, 201);
+  await call('POST', `/api/drafts/${dp1.id}/clauses`, { key: 'P1', title: '预览新增', body: 'p1-body' });
+  const pv1 = await call('POST', `/api/drafts/${dp1.id}/preview`, { note: 'v8预览' }, 200);
+  ok(typeof pv1.token === 'string' && pv1.token.length > 20, '预览成功返回确认凭据');
+  ok(pv1.schedule_status === 'immediate' && pv1.effective_at === null, '即时预览生效安排为 immediate / null');
+  ok(pv1.replayed === false && pv1.latest_version_id === 7, '预览基于最新 v7 且无需重放');
+  ok(pv1.version.order.includes('P1') && pv1.version.clauses.some((c) => c.key === 'P1'), '预览给出将要落库的条款正文与顺序');
+  ok(pv1.diff.added.includes('P1'), '预览给出相对最新发布版的差异（新增 P1）');
+  ov = await call('GET', '/api/overview');
+  ok(ov.latest_version_id === 7, '预览不写版本（最新版仍为 v7）');
+  det = await call('GET', `/api/drafts/${dp1.id}`);
+  ok(det.status === 'open', '预览不关闭草案');
+
+  // 凭据可查看：usable=true
+  const pvGet = await call('GET', `/api/drafts/${dp1.id}/previews/${pv1.token}`);
+  ok(pvGet.usable === true && pvGet.status === 'open', 'GET 预览显示凭据可用');
+
+  // 2) 持凭据确认：同一事务发布与预览完全一致的内容 -> v8
+  const conf1 = await call('POST', `/api/drafts/${dp1.id}/publish`, { preview_token: pv1.token }, 201);
+  ok(conf1.version_id === 8 && conf1.confirmed_preview === true, '凭据确认发布为 v8');
+  const v8 = await call('GET', '/api/versions/8');
+  ok(v8.clauses.some((c) => c.key === 'P1' && c.body === 'p1-body'), 'v8 落库内容与预览一致');
+  // 凭据不可重复使用
+  const reuse = await call('POST', `/api/drafts/${dp1.id}/publish`, { preview_token: pv1.token }, 409);
+  ok(reuse.error === 'CLOSED', '凭据不可重复使用且草案已关闭');
+  // GET 凭据：consumed / 不可用
+  const pvGetUsed = await call('GET', `/api/drafts/${dp1.id}/previews/${pv1.token}`);
+  ok(pvGetUsed.usable === false && pvGetUsed.status === 'consumed', '已消费凭据显示不可用');
+
+  // 3) 草案被编辑 -> 凭据失效，草案保留
+  const dp2 = await call('POST', '/api/drafts', { name: '预览dp2' }, 201);
+  await call('PUT', `/api/drafts/${dp2.id}/clauses/A`, { title: '总则', body: 'AAA-preview' });
+  const pv2 = await call('POST', `/api/drafts/${dp2.id}/preview`, { note: 'editA' }, 200);
+  await call('PUT', `/api/drafts/${dp2.id}/clauses/A`, { title: '总则', body: 'AAA-preview-2' });
+  const staleEdit = await call('POST', `/api/drafts/${dp2.id}/publish`, { preview_token: pv2.token }, 409);
+  ok(staleEdit.error === 'PREVIEW_STALE' && staleEdit.reason === 'draft-edited' && staleEdit.repreview === true, '草案被编辑使凭据失效并要求重新预览');
+  det = await call('GET', `/api/drafts/${dp2.id}`);
+  ok(det.status === 'open', '凭据失效后草案原样保留');
+
+  // 4) 重新预览后，其他草案先发布 -> 凭据失效；再次预览可确认（不相交重放）
+  let pv2b = await call('POST', `/api/drafts/${dp2.id}/preview`, { note: 'editA2' }, 200);
+  const dp3 = await call('POST', '/api/drafts', { name: '直接插队v9' }, 201);
+  await call('POST', `/api/drafts/${dp3.id}/clauses`, { key: 'Q3', title: '插队条款', body: 'q3' });
+  await call('POST', `/api/drafts/${dp3.id}/publish`, { note: 'v9直接' }, 201);
+  const staleNewer = await call('POST', `/api/drafts/${dp2.id}/publish`, { preview_token: pv2b.token }, 409);
+  ok(staleNewer.reason === 'newer-version-published', '其他草案先发布使凭据失效');
+  pv2b = await call('POST', `/api/drafts/${dp2.id}/preview`, { note: 'editA3' }, 200);
+  const conf2 = await call('POST', `/api/drafts/${dp2.id}/publish`, { preview_token: pv2b.token }, 201);
+  ok(conf2.version_id === 10 && conf2.replayed === true, '重新预览后凭据确认发布为 v10（重放）');
+  const v10 = await call('GET', '/api/versions/10');
+  ok(v10.clauses.some((c) => c.key === 'A' && c.body === 'AAA-preview-2') && v10.clauses.some((c) => c.key === 'Q3'),
+    'v10 同时含草案 A 修改与他人先发布的 Q3（不相交重放）');
+
+  // 5) 确认时回显与预览不同的说明 / 时刻 -> 400 CONFIRM_MISMATCH
+  const dpM = await call('POST', '/api/drafts', { name: '回显校验' }, 201);
+  await call('POST', `/api/drafts/${dpM.id}/clauses`, { key: 'MM', title: 'M', body: 'm' });
+  const pvM = await call('POST', `/api/drafts/${dpM.id}/preview`, { note: '锁定说明' }, 200);
+  const mm = await call('POST', `/api/drafts/${dpM.id}/publish`, { preview_token: pvM.token, note: '另一个说明' }, 400);
+  ok(mm.error === 'CONFIRM_MISMATCH', '确认携带不同发布说明被拒绝');
+
+  // 6) 预览冲突 / 草案无效：不发凭据、草案保留
+  const dc = await call('POST', '/api/drafts', { name: '冲突预览', baseline_id: 9 }, 201);
+  await call('PUT', `/api/drafts/${dc.id}/clauses/A`, { title: '总则', body: 'AAA-conflict' });
+  const pvConflict = await call('POST', `/api/drafts/${dc.id}/preview`, { note: 'x' }, 409);
+  ok(pvConflict.error === 'CONFLICT' && pvConflict.token === undefined, '预览遇三方冲突被拒且不返回凭据');
+  det = await call('GET', `/api/drafts/${dc.id}`);
+  ok(det.status === 'open', '冲突预览后草案保留');
+  const di = await call('POST', '/api/drafts', { name: '无效预览' }, 201);
+  await call('POST', `/api/drafts/${di.id}/refs`, { source: 'A', target: 'NOPE', label: '' });
+  const pvInvalid = await call('POST', `/api/drafts/${di.id}/preview`, { note: 'x' }, 409);
+  ok(pvInvalid.error === 'DRAFT_INVALID' && pvInvalid.token === undefined, '草案含悬空引用时预览被拒且不返回凭据');
+
+  // 7) 不存在/不属于该草案的凭据 -> 404
+  const noTok = await call('POST', `/api/drafts/${di.id}/publish`, { preview_token: 'not-a-real-token' }, 404);
+  ok(noTok.error === 'PREVIEW_NOT_FOUND' && noTok.repreview === true, '未知凭据 404 并提示重新预览');
+
+  // 8) 现有直接发布调用与错误语义继续可用
+  const dd = await call('POST', '/api/drafts', { name: '直接发布' }, 201);
+  await call('POST', `/api/drafts/${dd.id}/clauses`, { key: 'DD', title: '直接', body: 'dd' });
+  const directPub = await call('POST', `/api/drafts/${dd.id}/publish`, { note: 'v11直接' }, 201);
+  ok(directPub.version_id === 11 && directPub.confirmed_preview === undefined, '直接发布仍返回 201 且语义不变');
+  const dnoop = await call('POST', '/api/drafts', { name: '预览无改动' }, 201);
+  const pvNoop = await call('POST', `/api/drafts/${dnoop.id}/preview`, {}, 400);
+  ok(pvNoop.error === 'NO_CHANGES', '无改动预览沿用 NO_CHANGES 错误语义');
+  const pvNaive = await call('POST', `/api/drafts/${dnoop.id}/preview`, { effective_at: '2027-01-01T00:00:00' }, 400);
+  ok(pvNaive.error === 'VALIDATION', '预览同样拒绝不带时区设计符的时刻');
+
+  // 9) 定时预览不入队；确认后入队；改期/取消使凭据失效
+  const ds1 = await call('POST', '/api/drafts', { name: '定时预览' }, 201);
+  await call('POST', `/api/drafts/${ds1.id}/clauses`, { key: 'S1', title: '定时', body: 's1' });
+  const tSched = new Date(Date.now() + 3600_000).toISOString();
+  const pvSched = await call('POST', `/api/drafts/${ds1.id}/preview`, { note: 'v12定时', effective_at: tSched }, 200);
+  ok(pvSched.schedule_status === 'scheduled' && pvSched.effective_at === tSched && pvSched.would_enqueue.position_after === 0, '定时预览锁定未来时刻与队列位置');
+  let sch = await call('GET', '/api/schedule');
+  ok(sch.pending.length === 0, '定时预览不入队（排程不变）');
+  const confSched = await call('POST', `/api/drafts/${ds1.id}/publish`, { preview_token: pvSched.token }, 201);
+  ok(confSched.version_id === 12 && confSched.schedule_status === 'scheduled' && confSched.schedule.pending.map((p) => p.id).join() === '12', '凭据确认定时发布并入队 v12');
+  rev = confSched.schedule.schedule_revision;
+
+  // 队列非空：即时预览拒绝；乱序时刻预览拒绝
+  const ds2 = await call('POST', '/api/drafts', { name: '队列中预览' }, 201);
+  await call('POST', `/api/drafts/${ds2.id}/clauses`, { key: 'S2', title: 'S2', body: 's2' });
+  const pvQueued = await call('POST', `/api/drafts/${ds2.id}/preview`, { note: 'imm' }, 409);
+  ok(pvQueued.error === 'QUEUE_NOT_EMPTY', '队列非空时即时预览被拒并返回当前排程');
+  const pvOrder = await call('POST', `/api/drafts/${ds2.id}/preview`, { note: 'bad', effective_at: tSched }, 409);
+  ok(pvOrder.error === 'SCHEDULE_ORDER_VIOLATION', '预览时刻不晚于队列末尾被拒');
+
+  // 合法定时预览后取消队列中的版本 -> schedule-changed
+  const tSched2 = new Date(Date.now() + 7200_000).toISOString();
+  const pvS2 = await call('POST', `/api/drafts/${ds2.id}/preview`, { note: 'ok', effective_at: tSched2 }, 200);
+  const cancel12 = await call('POST', '/api/versions/12/cancel', { schedule_revision: rev }, 200);
+  rev = cancel12.schedule_revision;
+  const pvS2Get = await call('GET', `/api/drafts/${ds2.id}/previews/${pvS2.token}`);
+  ok(pvS2Get.usable === false && pvS2Get.stale_reason === 'schedule-changed', 'GET 预览反映排程变化导致的失效');
+  const staleCancel = await call('POST', `/api/drafts/${ds2.id}/publish`, { preview_token: pvS2.token }, 409);
+  ok(staleCancel.reason === 'schedule-changed' && staleCancel.schedule.pending.length === 0, '取消排程使凭据失效并返回当前排程');
+
+  // 预定时刻已过 -> effective-time-passed（队列已空）
+  const tSoon = new Date(Date.now() + 2000).toISOString();
+  const pvSoon = await call('POST', `/api/drafts/${ds2.id}/preview`, { note: 'soon', effective_at: tSoon }, 200);
+  await sleep(2500);
+  const stalePassed = await call('POST', `/api/drafts/${ds2.id}/publish`, { preview_token: pvSoon.token }, 409);
+  ok(stalePassed.reason === 'effective-time-passed', '预定时刻已过使凭据失效');
+  det = await call('GET', `/api/drafts/${ds2.id}`);
+  ok(det.status === 'open', '时刻过期后草案保留，可重新预览');
+
   console.log(`\n${pass} 项端到端断言全部通过`);
 }
 

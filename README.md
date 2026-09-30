@@ -13,6 +13,7 @@
 - 草案允许**暂存悬空引用**并在界面明确标红，但**不能发布**；
 - 发布成功在**单个 SQLite 原子事务**中写入不可变新版本；历史版本可完整**还原该版的条款顺序、正文与引用**，并支持任意两版差异对比。
 - 发布可指定**晚于当前时间的 UTC 生效时刻**：发布后仍**立即生成不可变版本快照**，但到点才自动成为当前生效版（惰性生效，无后台任务）。
+- 发布前可**预览将要落库的最终版本**：沿用三方重放与排程规则，返回相对最新发布版的正文/顺序/引用差异及一次性**确认凭据**；预览不写版本、不关闭草案。持凭据确认时只能在同一事务内发布与预览**完全一致**的内容及生效安排；草案被编辑、他人先发布、排程改期/取消或预定时刻已过均使凭据失效并保留草案。
 - 页面「生效排程」展示**当前生效版**与**待生效队列**，支持生效前**改期 / 取消**（携带读取时的**排程修订号**乐观并发控制）。
 - 可按任意 UTC 时点查询**当时生效版本**的完整条款、顺序与引用；**已发生时点的结果不随后续改期或取消变化**。
 
@@ -90,9 +91,11 @@ Docker Compose 额外支持：
    - 移动条款顺序、删除条款；
    - 新增/删除引用，允许引用暂不存在的条款——会被标记为**悬空引用**并阻止发布。
 4. **查看差异**：草案页实时显示相对基线的新增/删除/修改/移动与引用增删，可打开“正文差异”查看逐字增删（`<ins>` / `<del>`）。
-5. **发布**：
-   - 草案存在错误级问题（空正文、悬空引用、标识重复等）时禁止发布；
-   - 若基线不是最新版，发布在 `BEGIN IMMEDIATE` 事务内把改动重放到最新版；不相交改动合并成功则生成新版本；同条款双方改动或重放后悬空则返回冲突说明、回滚事务并保留草案；
+5. **发布**（推荐先预览再确认，也可直接发布）：
+   - 草案存在错误级问题（空正文、悬空引用、标识重复等）时禁止预览与发布；
+   - 点「预览将要落库的版本」可查看经三方重放后的最终条款正文、顺序、引用差异与生效安排：**预览不写版本、不关闭草案**，仅在预览成功时返回确认凭据；
+   - 点「按预览内容确认发布」持凭据在**同一原子事务**内复核落库；预览后草案被编辑、其他草案先发布、排程改期/取消或预定时刻已过，都会收到 `PREVIEW_STALE` 及原因并保留草案，重新预览即可；
+   - 「立即发布（不预览）」沿用原有直接发布路径：若基线不是最新版，在 `BEGIN IMMEDIATE` 事务内把改动重放到最新版；不相交改动合并成功则生成新版本；同条款双方改动或重放后悬空则返回冲突说明、回滚事务并保留草案；
    - 发布时可选择「立即生效」或「定时生效」（UTC 时刻，必须晚于当前）。
 6. **发布历史**：在“发布历史”中查看每个不可变版本（顺序/正文/引用完整还原），可下拉选择任意其他版本做两版对比；版本列表标注「即时生效 / 待生效 / 已取消」与生效时刻。
 7. **生效排程**：在“生效排程”页查看当前生效版、待生效队列与排程修订号，对待生效版本改期或取消，并按任意 UTC 时点查询当时生效版本。
@@ -145,7 +148,60 @@ Docker Compose 额外支持：
 | `POST` | `/api/drafts/:id/clauses/:key/move` | 移动条款 `{ordinal}` 或 `{after}` |
 | `POST` | `/api/drafts/:id/refs` | 新增引用（允许悬空暂存） |
 | `DELETE` | `/api/drafts/:id/refs/:ordinal` | 删除引用 |
-| `POST` | `/api/drafts/:id/publish` | 原子发布；可选 `effective_at`（未来 UTC 时刻）定时生效 |
+| `POST` | `/api/drafts/:id/preview` | 预览将要落库的最终版本（不写版本、不关闭草案）；成功返回确认凭据 |
+| `GET` | `/api/drafts/:id/previews/:token` | 查看预览内容及凭据当前是否仍可确认 |
+| `POST` | `/api/drafts/:id/publish` | 原子发布；可选 `effective_at`（未来 UTC 时刻）定时生效；携带 `preview_token` 时为凭据确认发布 |
+
+### 发布前预览与凭据确认（推荐）
+
+正式落库前可先预览**将要写入的最终版本**：系统沿用既有的三方重放与排程规则，计算出相对**最新发布版**的条款正文、顺序、引用差异，并返回一个一次性**确认凭据**。
+
+- 预览**不写版本、不关闭草案**；只有预览本身成功（无冲突、无悬空、排程规则通过）才返回凭据；
+- 凭据把**草案内容、发布说明、生效安排、当时的最新发布版与排程修订号**一起锁定；
+- 持凭据确认时，在**同一个 `BEGIN IMMEDIATE` 原子事务**内复核并落库；下列任一情况都会使凭据失效，返回 `409 PREVIEW_STALE` 及失效原因（`reason`）并**保留草案**，需重新预览：
+  - `draft-edited`：预览后草案被编辑；
+  - `newer-version-published`：其他草案先发布（最新发布版已变化）；
+  - `schedule-changed`：待生效队列发生改期或取消（排程修订号变化）；
+  - `effective-time-passed`：预览锁定的预定生效时刻已过；
+  - `draft-closed` / `preview-consumed`：草案已发布或凭据已使用。
+- 确认请求可只发 `{ "preview_token": "..." }`（采用预览锁定的说明与生效安排）；若显式携带不同的 `note` 或 `effective_at`，以 `400 CONFIRM_MISMATCH` 拒绝，需重新预览。
+- 原有的**直接发布**调用（`POST /api/drafts/:id/publish` 不带凭据）及其全部错误语义保持不变；页面弹窗同时提供「预览将要落库的版本」「按预览内容确认发布」与「立即发布（不预览）」。
+
+```bash
+# 1) 预览（可选 effective_at，规则与直接发布完全一致；预览不入队）
+curl -s -X POST http://localhost:3000/api/drafts/7/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"note":"秋季修订","effective_at":"2026-10-01T08:30:00Z"}'
+# -> 200
+# { "token": "Ab3...确认凭据",
+#   "draft_id": 7, "draft_status": "open",
+#   "latest_version_id": 4, "replayed": true,            // 是否需要三方重放
+#   "schedule_status": "scheduled",                      // immediate | scheduled
+#   "effective_at": "2026-10-01T08:30:00.000Z",
+#   "would_enqueue": { "position_after": 0, "tail_version_id": null },
+#   "version": { order, clauses, refs },                 // 将要落库的最终版本
+#   "diff": { added, deleted, changed, moved,
+#             refs_added, refs_removed, changed_detail } // 相对最新发布版的差异
+# }
+# 预览失败时沿用直接发布的错误语义与状态码，且不返回 token：
+#   409 CONFLICT（冲突/悬空）、409 DRAFT_INVALID、409 QUEUE_NOT_EMPTY、
+#   409 SCHEDULE_ORDER_VIOLATION、400 PAST_EFFECTIVE_AT、400 VALIDATION、400 NO_CHANGES
+
+# 2) 查看预览（页面打开凭据时使用；失效时 usable=false 并给出 stale_reason）
+curl -s http://localhost:3000/api/drafts/7/previews/Ab3...
+
+# 3) 持凭据确认：同事务复核，只发布与预览完全一致的内容及生效安排
+curl -s -X POST http://localhost:3000/api/drafts/7/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"preview_token":"Ab3..."}'
+# -> 201 { "version_id": 5, "confirmed_preview": true, "replayed": true,
+#          "schedule_status": "scheduled", "effective_at": "...", "schedule": {...} }
+
+# 4) 凭据失效 -> 409，草案保留，重新预览后再确认
+# { "error": "PREVIEW_STALE", "reason": "draft-edited",
+#   "message": "预览后草案已被编辑，凭据失效；请重新预览",
+#   "repreview": true, "draft_id": 7 }
+```
 
 ### 定时生效调用示例（curl）
 
@@ -190,19 +246,19 @@ curl -s 'http://localhost:3000/api/effective'   # 当前生效版
 ├── package.json
 ├── README.md
 ├── src
-│   ├── server.js      # HTTP 服务、API、原子发布事务、生效排程/改期/取消、时点查询
-│   ├── db.js          # SQLite 连接、建表、版本/草案快照读写、排程修订号
+│   ├── server.js      # HTTP 服务、API、发布预览凭据、原子发布事务、生效排程/改期/取消、时点查询
+│   ├── db.js          # SQLite 连接、建表、版本/草案/预览凭据快照读写、排程修订号
 │   └── model.js       # 纯逻辑：差异、移动判定、三方重放、悬空引用校验、生效判定/队列
 ├── public
 │   ├── index.html     # 单页应用入口
 │   ├── styles.css
-│   └── app.js         # 首版录入 / 草案编辑 / 差异 / 发布 / 历史还原 / 生效排程
+│   └── app.js         # 首版录入 / 草案编辑 / 差异 / 发布预览与确认 / 历史还原 / 生效排程
 └── test
     ├── model.test.js  # 核心合并逻辑与排程判定单元测试（npm test）
-    └── e2e.js         # 端到端 API 冒烟测试（含定时生效/改期/取消/时点查询）
+    └── e2e.js         # 端到端 API 冒烟测试（含预览凭据、定时生效/改期/取消/时点查询）
 ```
 
 ## 数据持久化与备份
 
 - 本地运行：数据库即 `DB_PATH` 指向的文件（默认 `./data/charter.db`，WAL 模式另有 `-wal`/`-shm` 伴生文件）。
-- Docker：使用命名卷 `charter-data`，可用 `docker cp` 或直接挂载卷备份；已发布版本的**条款内容快照**只追加、不更新不删除，具备不可变性。排程仅改 `effective_at` 或置 `schedule_status = cancelled`，不触碰条款快照；升级后首次启动会自动为旧库补齐排程列（旧版本按发布时刻即时生效）。
+- Docker：使用命名卷 `charter-data`，可用 `docker cp` 或直接挂载卷备份；已发布版本的**条款内容快照**只追加、不更新不删除，具备不可变性。排程仅改 `effective_at` 或置 `schedule_status = cancelled`，不触碰条款快照；升级后首次启动会自动为旧库补齐排程列（旧版本按发布时刻即时生效）。发布预览凭据存于 `publish_previews` 表（预览只追加凭据行，不写版本、不改草案；确认成功后凭据置为 `consumed`），随数据库一起持久化，删除该表不影响已发布版本的还原。

@@ -77,6 +77,26 @@ CREATE TABLE IF NOT EXISTS draft_refs (
   deleted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_draft_refs_draft ON draft_refs(draft_id);
+
+-- 发布预览凭据：预览只生成凭据、不写版本、草案保持 open；
+-- 确认时在同一事务内复核：草案内容/最新版/排程修订号/生效时刻任一变化即失效。
+CREATE TABLE IF NOT EXISTS publish_previews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id INTEGER NOT NULL REFERENCES drafts(id),
+  token TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  note TEXT NOT NULL,                       -- 预览锁定的发布说明
+  schedule_status TEXT NOT NULL,           -- immediate | scheduled（预览锁定的生效安排）
+  effective_at TEXT,                       -- scheduled：锁定的未来 UTC 时刻；immediate：NULL
+  latest_version_id INTEGER NOT NULL,      -- 预览时的最新发布版（他人先发即失效）
+  schedule_revision INTEGER NOT NULL,      -- 预览时的排程修订号（改期/取消即失效）
+  draft_fingerprint TEXT NOT NULL,         -- 草案内容指纹（草案被编辑即失效）
+  final_fingerprint TEXT NOT NULL,         -- 将落库最终状态指纹（确认时复核一致性）
+  final_moved TEXT NOT NULL DEFAULT '[]',  -- 将落库版本的显式移动集合
+  payload_json TEXT NOT NULL,              -- 预览响应快照（供页面查看）
+  status TEXT NOT NULL DEFAULT 'open'      -- open | consumed（确认成功后置为 consumed）
+);
+CREATE INDEX IF NOT EXISTS idx_pubprev_draft ON publish_previews(draft_id);
 `;
 
 function openDb(dbPath) {
@@ -275,6 +295,48 @@ function replaceDraftContent(db, draftId, state) {
   db.prepare('UPDATE drafts SET updated_at = ? WHERE id = ?').run(nowIso(), draftId);
 }
 
+// ---------------------------------------------------------------------------
+// 发布预览凭据（调用方负责事务）
+// ---------------------------------------------------------------------------
+function insertPublishPreview(db, row) {
+  const info = db
+    .prepare(
+      `INSERT INTO publish_previews
+         (draft_id, token, created_at, note, schedule_status, effective_at,
+          latest_version_id, schedule_revision, draft_fingerprint, final_fingerprint,
+          final_moved, payload_json, status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'open')`,
+    )
+    .run(
+      row.draftId,
+      row.token,
+      nowIso(),
+      row.note,
+      row.scheduleStatus,
+      row.effectiveAt ?? null,
+      row.latestVersionId,
+      row.scheduleRevision,
+      row.draftFingerprint,
+      row.finalFingerprint,
+      JSON.stringify([...row.finalMoved]),
+      JSON.stringify(row.payload),
+    );
+  return info.lastInsertRowid;
+}
+
+function getPublishPreviewByToken(db, token) {
+  const row = db.prepare('SELECT * FROM publish_previews WHERE token = ?').get(token);
+  if (row) {
+    row.final_moved = JSON.parse(row.final_moved || '[]');
+    row.payload = JSON.parse(row.payload_json);
+  }
+  return row;
+}
+
+function markPublishPreviewConsumed(db, previewId) {
+  db.prepare("UPDATE publish_previews SET status = 'consumed' WHERE id = ?").run(previewId);
+}
+
 module.exports = {
   openDb,
   nowIso,
@@ -291,4 +353,7 @@ module.exports = {
   saveDraftMoved,
   getScheduleRevision,
   bumpScheduleRevision,
+  insertPublishPreview,
+  getPublishPreviewByToken,
+  markPublishPreviewConsumed,
 };

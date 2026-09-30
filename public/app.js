@@ -733,14 +733,28 @@ function openPublish(draftId) {
   const d = state.draft;
   const willReplay = d.baseline_id !== ov.latest_version_id;
 
+  // 预览状态：成功后持有确认凭据；说明/时刻任一变更或确认失效后清空
+  let preview = null;
+  const previewBox = el('div', {});
+
+  function invalidatePreview(msg) {
+    if (preview || msg) {
+      preview = null;
+      renderPreview();
+      if (msg) err.appendChild(renderIssueList([{ message: msg }]));
+    }
+  }
+
   // 生效时刻选择：即时 / 定时（UTC）
   const nowMs = Date.now();
   const modeImm = el('input', { type: 'radio', name: 'effmode', checked: true });
   const modeSch = el('input', { type: 'radio', name: 'effmode' });
   const effInput = el('input', { type: 'datetime-local', step: '1', disabled: true });
   effInput.value = localInputValue(new Date(nowMs + 3600_000).toISOString());
-  modeImm.addEventListener('change', () => { effInput.disabled = modeImm.checked; });
-  modeSch.addEventListener('change', () => { effInput.disabled = !modeSch.checked; });
+  modeImm.addEventListener('change', () => { effInput.disabled = modeImm.checked; invalidatePreview('已切换生效方式，请重新预览'); });
+  modeSch.addEventListener('change', () => { effInput.disabled = !modeSch.checked; invalidatePreview('已切换生效方式，请重新预览'); });
+  effInput.addEventListener('change', () => invalidatePreview('已修改生效时刻，请重新预览'));
+  note.addEventListener('input', () => { if (preview && note.value.trim() !== preview.note) invalidatePreview('已修改发布说明，请重新预览'); });
   const effHint = el('div', { class: 'muted small' }, '发布后立即生成不可变版本快照，到达该 UTC 时刻后自动成为当前生效版。');
 
   const queuePending = (ov.versions || []).filter(
@@ -755,6 +769,167 @@ function openPublish(draftId) {
     effInput.min = localInputValue(new Date(new Date(tail.effective_at).getTime() + 60_000).toISOString());
   }
 
+  function publishPayload() {
+    const payload = { note: note.value };
+    if (modeSch.checked) payload.effective_at = localInputToIso(effInput.value);
+    return payload;
+  }
+
+  // 直接发布（原有路径，错误语义不变）
+  async function directPublish() {
+    err.innerHTML = '';
+    if (modeSch.checked && !effInput.value) {
+      err.appendChild(renderIssueList([{ message: '请选择未来生效时刻' }])); return;
+    }
+    preview = null;
+    renderPreview();
+    try {
+      const r = await api('POST', `/api/drafts/${draftId}/publish`, publishPayload());
+      closeModal();
+      if (r.schedule_status === 'scheduled') {
+        toast(`已生成不可变 v${r.version_id}，将于 ${fmtUtc(r.effective_at)} 生效`, 'ok');
+      } else {
+        toast(`已原子发布：v${r.version_id}${r.replayed ? '（已重放到最新版）' : ''}`, 'ok');
+      }
+      state.draftId = null;
+      await refresh();
+    } catch (e) {
+      renderPublishError(e);
+    }
+  }
+
+  // 预览将要落库的最终版本（不写版本、不关闭草案）
+  async function runPreview() {
+    err.innerHTML = '';
+    if (modeSch.checked && !effInput.value) {
+      err.appendChild(renderIssueList([{ message: '请选择未来生效时刻' }])); return;
+    }
+    try {
+      const r = await api('POST', `/api/drafts/${draftId}/preview`, publishPayload());
+      preview = r;
+      renderPreview();
+      toast('预览成功：尚未写入任何版本，草案保持打开', 'ok');
+    } catch (e) {
+      preview = null;
+      renderPreview();
+      renderPublishError(e);
+    }
+  }
+
+  // 持凭据确认：只能发布与预览完全一致的内容及生效安排
+  async function confirmPreview() {
+    if (!preview) return;
+    err.innerHTML = '';
+    const payload = { preview_token: preview.token };
+    try {
+      const r = await api('POST', `/api/drafts/${draftId}/publish`, payload);
+      closeModal();
+      toast(`已按预览原子发布：v${r.version_id}${r.replayed ? '（已重放到最新版）' : ''}`, 'ok');
+      state.draftId = null;
+      await refresh();
+    } catch (e) {
+      const p = e.payload || {};
+      if (p.repreview) {
+        // 凭据失效：展示原因并要求重新预览，草案原样保留
+        preview = null;
+        renderPreview();
+        err.appendChild(renderIssueList([{ message: p.message || '预览凭据已失效，请重新预览' }]));
+      } else {
+        renderPublishError(e);
+      }
+    }
+  }
+
+  function renderPublishError(e) {
+    const p = e.payload || {};
+    if (p.error === 'CONFLICT') err.appendChild(renderPublishConflict(p));
+    else if (p.schedule) err.appendChild(renderIssueList([{ message: p.message || e.message }]));
+    else err.appendChild(renderIssueList(p.issues || [{ message: e.message }]));
+  }
+
+  function renderPreview() {
+    previewBox.innerHTML = '';
+    if (!preview) return;
+    const p = preview;
+    const box = el('div', { class: 'panel', style: 'margin:10px 0;border-color:var(--green)' });
+    box.appendChild(el('div', { class: 'panel-bd' },
+      el('div', { class: 'issue', style: 'background:var(--green-bg);color:#14532d' },
+        el('span', {}, '✅'),
+        el('div', {},
+          el('div', {}, el('strong', {}, '预览成功：这是将要落库的最终版本')),
+          el('div', { class: 'small muted' },
+            `尚未写入任何版本、草案仍保持打开；预览于 ${fmtTime(p.previewed_at)} 生成确认凭据。`),
+        ),
+      ),
+    ));
+
+    // 生效安排
+    const arrLine = p.schedule_status === 'scheduled'
+      ? el('div', { style: 'margin-top:8px' },
+          el('strong', {}, '生效安排：'), `定时 ${fmtUtc(p.effective_at)}（${fmtLocal(p.effective_at)}）`,
+          p.would_enqueue ? el('span', { class: 'muted small' },
+            `　确认后入队，位于当前队列第 ${p.would_enqueue.position_after + 1} 位${
+              p.would_enqueue.tail_version_id ? `（严格晚于 v${p.would_enqueue.tail_version_id}）` : ''}`) : null,
+        )
+      : el('div', { style: 'margin-top:8px' },
+          el('strong', {}, '生效安排：'), '确认发布后即时生效（effective_at 取确认时刻）');
+    box.querySelector('.panel-bd').appendChild(arrLine);
+    box.querySelector('.panel-bd').appendChild(el('div', { class: 'muted small', style: 'margin-top:4px' },
+      `相对最新发布版 v${p.latest_version_id} 进行${p.replayed ? '三方重放' : '直接发布'}${
+        p.replayed && p.baseline_id ? `（草案基线 v${p.baseline_id}）` : ''}`));
+
+    // 差异概览
+    const chips = [];
+    if (p.diff.added.length) chips.push(el('span', { class: 'badge ok' }, `新增 ${p.diff.added.length}：${p.diff.added.join('、')}`));
+    if (p.diff.deleted.length) chips.push(el('span', { class: 'badge err' }, `删除 ${p.diff.deleted.length}：${p.diff.deleted.join('、')}`));
+    if (p.diff.changed.length) chips.push(el('span', { class: 'badge warn' }, `修改 ${p.diff.changed.length}：${p.diff.changed.map((c) => c.key).join('、')}`));
+    if (p.diff.moved.length) chips.push(el('span', { class: 'badge neutral' }, `移动 ${p.diff.moved.length}：${p.diff.moved.join('、')}`));
+    if (p.diff.refs_added.length || p.diff.refs_removed.length) {
+      chips.push(el('span', { class: 'badge neutral' }, `引用 +${p.diff.refs_added.length} / −${p.diff.refs_removed.length}`));
+    }
+    if (!chips.length) chips.push(el('span', { class: 'muted small' }, '与最新发布版无差异'));
+    box.querySelector('.panel-bd').appendChild(el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-top:8px' }, ...chips));
+
+    // 条款正文逐字差异
+    const changedWithText = (p.diff.changed_detail || []).filter((c) => c.bodySegments || c.titleSegments);
+    if (changedWithText.length) {
+      box.querySelector('.panel-bd').appendChild(el('h4', { style: 'margin:12px 0 6px' }, '正文/标题差异'));
+      for (const c of changedWithText) {
+        const cb = el('div', { class: 'small', style: 'margin-bottom:6px' },
+          el('span', { class: 'key-chip' }, c.key), ' ');
+        if (c.titleSegments) cb.appendChild(el('div', { html: segmentsHtml(c.titleSegments) }));
+        if (c.bodySegments) cb.appendChild(el('div', { html: segmentsHtml(c.bodySegments) }));
+        box.querySelector('.panel-bd').appendChild(cb);
+      }
+    }
+    if (p.diff.refs_added.length || p.diff.refs_removed.length) {
+      const rb = el('div', { class: 'small' });
+      for (const r of p.diff.refs_removed) rb.appendChild(el('div', {}, el('del', {}, `${r.source} → ${r.target}${r.label ? '（' + r.label + '）' : ''}`)));
+      for (const r of p.diff.refs_added) rb.appendChild(el('div', {}, el('ins', {}, `${r.source} → ${r.target}${r.label ? '（' + r.label + '）' : ''}`)));
+      box.querySelector('.panel-bd').appendChild(el('h4', { style: 'margin:12px 0 6px' }, '引用差异'), rb);
+    }
+
+    // 最终条款顺序（将要落库）
+    const orderLine = el('div', { class: 'small muted', style: 'margin-top:10px' },
+      `最终条款顺序（${p.version.order.length} 条）：${p.version.order.join(' → ')}`);
+    box.querySelector('.panel-bd').appendChild(orderLine);
+    for (const c of p.version.clauses.slice(0, 8)) {
+      box.querySelector('.panel-bd').appendChild(el('div', { class: 'small muted' },
+        `#${c.ordinal + 1} ${c.key} ${c.title}：${String(c.body).slice(0, 60)}${c.body.length > 60 ? '…' : ''}`));
+    }
+    if (p.version.clauses.length > 8) {
+      box.querySelector('.panel-bd').appendChild(el('div', { class: 'small muted' }, `…其余 ${p.version.clauses.length - 8} 条发布后可在版本快照中查看`));
+    }
+
+    // 凭据确认
+    box.querySelector('.panel-bd').appendChild(el('div', { style: 'margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap' },
+      el('button', { class: 'btn', onclick: confirmPreview }, '按预览内容确认发布'),
+      el('span', { class: 'muted small' },
+        '确认在同一原子事务内复核；草案被编辑、他人先发布、排程改期/取消或预定时刻已过，凭据都会失效，需重新预览。'),
+    ));
+    previewBox.appendChild(box);
+  }
+
   modal({
     title: '发布草案为新版本',
     body: el('div', {},
@@ -762,6 +937,8 @@ function openPublish(draftId) {
         willReplay
           ? `基线 v${d.baseline_id} 已落后于最新发布版 v${ov.latest_version_id}：系统将在一个原子事务中，把本草案相对基线的不相交条款改动重放到最新版。若同一条款被双方改动，或重放后产生悬空引用，发布将被拒绝并说明冲突，草案原样保留。`
           : '将在一个原子事务中生成不可变的新版本；发布后历史可完整还原该版顺序、正文与引用。'),
+      el('p', { class: 'muted small' },
+        '推荐先「预览将要落库的版本」：可查看最终条款正文、顺序、引用差异及生效安排，预览不写版本、不关闭草案；再持返回的确认凭据发布。也可直接「立即发布」（原有方式保持可用）。'),
       el('label', { class: 'fld' }, el('span', {}, '版本说明'), note),
       el('div', { class: 'panel', style: 'margin:6px 0' },
         el('div', { class: 'panel-bd' },
@@ -784,42 +961,13 @@ function openPublish(draftId) {
           effHint,
         ),
       ),
+      previewBox,
       err,
     ),
     footer: [
       el('button', { class: 'btn ghost', onclick: closeModal }, '取消'),
-      el('button', {
-        class: 'btn',
-        onclick: async () => {
-          err.innerHTML = '';
-          const payload = { note: note.value };
-          if (modeSch.checked) {
-            if (!effInput.value) { err.appendChild(renderIssueList([{ message: '请选择未来生效时刻' }])); return; }
-            payload.effective_at = localInputToIso(effInput.value);
-          }
-          try {
-            const r = await api('POST', `/api/drafts/${draftId}/publish`, payload);
-            closeModal();
-            if (r.schedule_status === 'scheduled') {
-              toast(`已生成不可变 v${r.version_id}，将于 ${fmtUtc(r.effective_at)} 生效`, 'ok');
-            } else {
-              toast(`已原子发布：v${r.version_id}${r.replayed ? '（已重放到最新版）' : ''}`, 'ok');
-            }
-            state.draftId = null;
-            await refresh();
-          } catch (e) {
-            err.innerHTML = '';
-            const p = e.payload || {};
-            if (p.error === 'CONFLICT') {
-              err.appendChild(renderPublishConflict(p));
-            } else if (p.schedule) {
-              err.appendChild(renderIssueList([{ message: p.message || e.message }]));
-            } else {
-              err.appendChild(renderIssueList(p.issues || [{ message: e.message }]));
-            }
-          }
-        },
-      }, '确认发布'),
+      el('button', { class: 'btn secondary', onclick: runPreview }, '预览将要落库的版本'),
+      el('button', { class: 'btn', onclick: directPublish }, '立即发布（不预览）'),
     ],
   });
 }
